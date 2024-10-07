@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+smpplib
+python-dotenv
+xmltodict
+requests>=2.25.1
+pymongo
+python-multipart
+aiohttp
+
+
