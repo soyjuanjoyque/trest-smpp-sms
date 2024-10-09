@@ -1,225 +1,124 @@
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Request, Response, HTTPException
 import xmltodict
-from smpp_service_test import connect_to_smpp, send_smpp_message, disconnect_from_smpp
-from dotenv import load_dotenv
+import requests
 from pymongo import MongoClient
 import os
-from bulk_service import router as bulk_router
+import httpx
+import asyncio
+from dotenv import load_dotenv
 
 load_dotenv()
 
-MONGO_URI = os.getenv("MONGO_URI")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 client = MongoClient(MONGO_URI)
-db_name = os.getenv("MONGO_DB_NAME")
-collection_name = os.getenv("MONGO_COLLECTION_NAME")
-db = client[db_name]
-collection = db[collection_name]
+db = client[os.getenv("MONGO_DB_NAME", "logDB")]
+collection = db[os.getenv("MONGO_COLLECTION_NAME", "requestsLogs")]
 
-SMPP_SERVER = os.getenv("SMPP_SERVER")
-SMPP_PORT = int(os.getenv("SMPP_PORT"))
-SMPP_SYSTEM_ID = os.getenv("SMPP_SYSTEM_ID")
-SMPP_PASSWORD = os.getenv("SMPP_PASSWORD")
+REST_SERVER_URL = os.getenv("REST_SERVER_URL")
+AUTHORIZATION_HEADER = os.getenv("AUTHORIZATION_HEADER")
+CONTENT_TYPE = os.getenv("CONTENT_TYPE")
 
 app = FastAPI()
 
-app.include_router(bulk_router)
+async def send_message_async(client, xml_body):
+    response = await client.post(
+        REST_SERVER_URL,
+        headers={"Authorization": AUTHORIZATION_HEADER, "Content-Type": CONTENT_TYPE},
+        content=xml_body
+    )
+    
+    collection.insert_one({
+        "xml_body": xml_body.decode('utf-8'),
+        "response_status_code": response.status_code,
+        "response_text": response.text
+    })
+    
+    return response.text
 
-def validate_address(address):
-    return address.isalnum()
-
-@app.post("/sendMessage", response_class=Response)
+@app.post("/send_message")
 async def send_message(request: Request):
-    try:
-        request_body = await request.body()
+    xml_body = await request.body()
 
-        data = xmltodict.parse(request_body)
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            REST_SERVER_URL,
+            headers={"Authorization": AUTHORIZATION_HEADER, "Content-Type": CONTENT_TYPE},
+            content=xml_body
+        )
+    collection.insert_one({
+        "xml_body": xml_body.decode('utf-8'),
+        "response_status_code": response.status_code,
+        "response_text": response.text
+    })
+    return Response(content=response.content, media_type="application/xml")
 
-        ao_sms = data['AoSmsRequest']['AoSms']
-        aAddress = ao_sms.get('aAddress', SMPP_SYSTEM_ID)
-        bAddress = ao_sms['bAddress']
-        message = ao_sms['Message']
-        data_coding = int(ao_sms.get('DataCodingScheme', 0))
+@app.post("/query_message")
+async def query_message(request: Request):
+    xml_body = await request.body()
+    response = requests.post(
+        REST_SERVER_URL,
+        headers={"Authorization": AUTHORIZATION_HEADER, "Content-Type": CONTENT_TYPE},
+        data=xml_body
+    )
+    return Response(content=response.content, media_type="application/xml")
 
-        if not validate_address(aAddress):
-            return Response(
-                content=xmltodict.unparse({
-                    "AoSmsResponse": {
-                        "Code": "1",
-                        "Description": "Invalid aAddress",
-                        "ResultList": {
-                            "Result": {
-                                "MessageId": None,
-                                "Status": "3",
-                                "Description": "Invalid Address"
-                            }
-                        }
-                    }
-                }, pretty=True), media_type="application/xml")
-        if not validate_address(bAddress):
-            return Response(
-                content=xmltodict.unparse({
-                    "AoSmsResponse": {
-                        "Code": "1",
-                        "Description": "Invalid bAddress",
-                        "ResultList": {
-                            "Result": {
-                                "MessageId": None,
-                                "Status": "3",
-                                "Description": "Invalid Address"
-                            }
-                        }
-                    }
-                }, pretty=True), media_type="application/xml")
-
-        client = connect_to_smpp(SMPP_SERVER, SMPP_PORT, SMPP_SYSTEM_ID, SMPP_PASSWORD)
-        result = send_smpp_message(client, aAddress, bAddress, message)
-        disconnect_from_smpp(client)
-
-        message_id = result['message_id']
-        description = "Message sent successfully"
-
-        mensaje_guardado = {
-            "MessageId": message_id,
-            "aAddress": aAddress,
-            "bAddress": bAddress,
-            "Message": message,
-            "DataCodingScheme": data_coding,
-            "Status": "0",
-            "Description": description
-        }
-        collection.insert_one(mensaje_guardado)
-
-        response_dict = {
-            "AoSmsResponse": {
-                "Code": "0",
-                "Description": "No Error",
-                "ResultList": {
-                    "Result": {
-                        "MessageId": message_id,
-                        "Status": "0",
-                        "Description": description
-                    }
-                }
-            }
-        }
-
-        xml_response = xmltodict.unparse(response_dict, pretty=True)
-        return Response(content=xml_response, media_type="application/xml")
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/queryMessage", response_class=Response)
-async def query_message(message_id: int):
-    try:
-        mensaje = collection.find_one({"MessageId": message_id})
-
-        if not mensaje:
-            return Response(
-                content=xmltodict.unparse({
-                    "AoSmsResponse": {
-                        "Code": "1",
-                        "Description": "Message not found",
-                        "ResultList": {
-                            "Result": {
-                                "MessageId": None,
-                                "Status": "1",
-                                "Description": "Message ID not found"
-                            }
-                        }
-                    }
-                }, pretty=True), media_type="application/xml")
-
-        response_dict = {
-            "AoSmsResponse": {
-                "Code": "0",
-                "Description": "No Error",
-                "ResultList": {
-                    "Result": {
-                        "MessageId": mensaje["MessageId"],
-                        "Status": mensaje["Status"],
-                        "Description": mensaje["Description"]
-                    }
-                }
-            }
-        }
-
-        xml_response = xmltodict.unparse(response_dict, pretty=True)
-        return Response(content=xml_response, media_type="application/xml")
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/cancelMessage", response_class=Response)
+@app.post("/cancel_message")
 async def cancel_message(request: Request):
-    try:
-        request_body = await request.body()
-        data = xmltodict.parse(request_body)
-        
-        message_id = data['AoSmcancelRequest']['AoSmcancel'].get('MessageId')
-        aAddress = data['AoSmcancelRequest']['AoSmcancel'].get('aAddress')
+    xml_body = await request.body()
+    data = xmltodict.parse(xml_body)
+    message_id = data.get('AoSmcancelRequest', {}).get('AoSmcancel', {}).get('MessageId')
+    a_address = data.get('AoSmcancelRequest', {}).get('AoSmcancel', {}).get('aAddress')
 
-        if not message_id or not aAddress:
-            return Response(
-                content=xmltodict.unparse({
-                    "AoSmcancelResponse": {
-                        "Code": "1",
-                        "Description": "Faltan MessageId o aAddress",
-                        "ResultList": {
-                            "Result": {
-                                "Status": "1",
-                                "Description": "Solicitud inválida, se requieren tanto MessageId como aAddress"
-                            }
-                        }
-                    }
-                }, pretty=True), media_type="application/xml")
-        
-        mensaje = collection.find_one({"MessageId": int(message_id)})
-
-        if not mensaje:
-            return Response(
-                content=xmltodict.unparse({
-                    "AoSmcancelResponse": {
-                        "Code": "1",
-                        "Description": "Mensaje no encontrado",
-                        "ResultList": {
-                            "Result": {
-                                "Status": "1",
-                                "Description": "Message ID no encontrado"
-                            }
-                        }
-                    }
-                }, pretty=True), media_type="application/xml")
-
-        collection.update_one({"MessageId": int(message_id)}, {"$set": {"Status": "Cancelado", "Description": "Mensaje cancelado"}})
-
-        response_dict = {
-            "AoSmcancelResponse": {
-                "Code": "0",
-                "Description": "No Error",
-                "ResultList": {
-                    "Result": {
-                        "Status": "0",
-                        "Description": "Mensaje cancelado exitosamente"
-                    }
-                }
-            }
-        }
-
-        xml_response = xmltodict.unparse(response_dict, pretty=True)
-        return Response(content=xml_response, media_type="application/xml")
-
-    except Exception as e:
+    if not message_id or not a_address:
         return Response(
             content=xmltodict.unparse({
                 "AoSmcancelResponse": {
                     "Code": "1",
-                    "Description": str(e),
+                    "Description": "Missing MessageId or aAddress",
                     "ResultList": {
                         "Result": {
                             "Status": "1",
-                            "Description": "Ocurrió un error durante la cancelación"
+                            "Description": "Invalid request, both MessageId and aAddress are required"
                         }
                     }
                 }
             }, pretty=True), media_type="application/xml")
+
+    response = requests.post(
+        REST_SERVER_URL,
+        headers={"Authorization": AUTHORIZATION_HEADER, "Content-Type": CONTENT_TYPE},
+        data=xml_body
+    )
+    collection.update_one({"MessageId": int(message_id)}, {"$set": {"Status": "Cancelled", "Description": "Message cancelled"}})
+    return Response(content=response.content, media_type="application/xml")
+
+@app.post("/bulk_send")
+async def bulk_send(request: Request):
+    try:
+        body = await request.json()
+        a_address = body['aAddress']
+        b_addresses = body['bAddresses']
+        message = body['Message']
+        data_coding_scheme = body['DataCodingScheme']
+
+        async with httpx.AsyncClient() as client:
+            tasks = []
+            for b_address in b_addresses:
+                xml_body = f"""
+                    <AoSmsRequest>
+                        <AoSms>
+                            <aAddress>{a_address}</aAddress>
+                            <bAddress>{b_address}</bAddress>
+                            <Message>{message}</Message>
+                            <DataCodingScheme>{data_coding_scheme}</DataCodingScheme>
+                        </AoSms>
+                    </AoSmsRequest>
+                """
+                tasks.append(send_message_async(client, xml_body.encode('utf-8')))
+
+            results = await asyncio.gather(*tasks)
+
+        return {"results": results}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

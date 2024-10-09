@@ -7,5 +7,6 @@ requests>=2.25.1
 pymongo
 python-multipart
 aiohttp
+httpx
 
 
