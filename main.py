@@ -1,14 +1,12 @@
 from fastapi import FastAPI, Request, Response, HTTPException
 import xmltodict
-import requests
 from pymongo import MongoClient
 import os
-import httpx
-import asyncio
-import paramiko
 import base64
 import logging
 from dotenv import load_dotenv
+import httpx
+import asyncio
 
 load_dotenv()
 
@@ -21,43 +19,25 @@ REST_SERVER_BASE_URL = os.getenv("REST_SERVER_BASE_URL")
 AUTHORIZATION_HEADER = os.getenv("AUTHORIZATION_HEADER")
 CONTENT_TYPE = os.getenv("CONTENT_TYPE")
 
-SSH_HOST = os.getenv("SSH_HOST")
-SSH_PORT = int(os.getenv("SSH_PORT", 22))
-SSH_USERNAME = os.getenv("SSH_USERNAME")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD")
-
 app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
 
-def send_via_ssh(xml_body: str, endpoint: str):
+async def send_request(xml_body: str, endpoint: str):
     try:
-        ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
-        logging.info(f"Connecting to SSH host {SSH_HOST}:{SSH_PORT} with username {SSH_USERNAME}")
-        ssh_client.connect(SSH_HOST, SSH_PORT, SSH_USERNAME, SSH_PASSWORD)
-        logging.info("SSH connection established successfully")
-
         url = f"{REST_SERVER_BASE_URL}/{endpoint}"
-
-        command = f"""curl --location '{url}' \
-        --header 'Authorization: {AUTHORIZATION_HEADER}' \
-        --header 'Content-Type: {CONTENT_TYPE}' \
-        --data '{xml_body}'"""
-
-        logging.info(f"Executing command via SSH: {command}")
-        stdin, stdout, stderr = ssh_client.exec_command(command)
-
-        response = stdout.read().decode()
-        ssh_client.close()
-
-        logging.info("SSH command executed successfully, response received.")
-        return response
-
-    except Exception as e:
-        logging.error(f"SSH connection or command failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"SSH connection or command failed: {str(e)}")
+        headers = {
+            'Authorization': AUTHORIZATION_HEADER,
+            'Content-Type': CONTENT_TYPE
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, data=xml_body)
+        logging.info(f"Request sent to {url}, received status: {response.status_code}")
+        response.raise_for_status()
+        return response.text
+    except httpx.RequestError as e:
+        logging.error(f"Request failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Request failed: {str(e)}")
 
 def encode_message_in_base64(xml_body: str) -> str:
     xml_dict = xmltodict.parse(xml_body)
@@ -76,7 +56,7 @@ async def send_message(request: Request):
         
         xml_body_encoded = encode_message_in_base64(xml_body.decode('utf-8'))
 
-        response = send_via_ssh(xml_body.decode('utf-8'), "AoSms")
+        response = await send_request(xml_body.decode('utf-8'), "AoSms")
         
         log_entry = {
             "xml_body": xml_body.decode('utf-8'),
@@ -84,20 +64,18 @@ async def send_message(request: Request):
             "response": response
         }
         
-        print("Log Entry to be inserted:", log_entry)
-        
         collection.insert_one(log_entry)
         
         return Response(content=response, media_type="application/xml")
     except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query_message")
 async def query_message(request: Request):
     try:
         xml_body = await request.body()
 
-        response = send_via_ssh(xml_body.decode('utf-8'), "AoSmquery")
+        response = await send_request(xml_body.decode('utf-8'), "AoSmquery")
 
         return Response(content=response, media_type="application/xml")
     except Exception as e:
@@ -126,7 +104,7 @@ async def cancel_message(request: Request):
                     }
                 }, pretty=True), media_type="application/xml")
 
-        response = send_via_ssh(xml_body.decode('utf-8'), "AoSmcancel")
+        response = await send_request(xml_body.decode('utf-8'), "AoSmcancel")
 
         collection.update_one(
             { "response": { "$regex": message_id } },
@@ -150,7 +128,7 @@ async def send_message_async(a_address: str, b_address: str, message: str, data_
             </AoSmsRequest>
         """
         xml_body_encoded = encode_message_in_base64(xml_body)
-        response = send_via_ssh(xml_body_encoded, "AoSms")
+        response = await send_request(xml_body_encoded, "AoSms")
 
         log_entry = {
             "aAddress": a_address,
@@ -165,7 +143,7 @@ async def send_message_async(a_address: str, b_address: str, message: str, data_
         return {"bAddress": b_address, "response": response}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 @app.post("/bulk_send")
 async def bulk_send(request: Request):
     try:
