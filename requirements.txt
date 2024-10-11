@@ -8,5 +8,4 @@ pymongo
 python-multipart
 aiohttp
 httpx
-
-
+paramiko
